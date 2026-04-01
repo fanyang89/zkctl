@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rustyline::{
     Context as RustylineContext, Editor, Helper,
     completion::{Completer, Pair},
@@ -15,11 +15,11 @@ use rustyline::{
     validate::Validator,
 };
 use tokio::{runtime::Handle, task::block_in_place};
-use zookeeper_client::{Acls, Client, CreateMode, Stat};
+use zookeeper_client::{Acls, Client, CreateMode, Error as ZkError, Stat};
 
 const COMMANDS: &[&str] = &[
-    "connect", "auth", "ls", "cd", "pwd", "get", "stat", "exists", "create", "set", "delete",
-    "help", "quit", "exit",
+    "connect", "auth", "ls", "cd", "pwd", "get", "stat", "exists", "create", "set", "setv",
+    "delete", "delv", "help", "quit", "exit",
 ];
 
 const DEFAULT_SERVERS: &str = "127.0.0.1:2181";
@@ -55,6 +55,23 @@ enum PathCompletionMode {
 
 struct ReplHelper {
     state: Arc<Mutex<CompletionState>>,
+}
+
+struct DeleteArgs<'a> {
+    recursive: bool,
+    expected_version: Option<i32>,
+    path: &'a str,
+}
+
+struct GetArgs {
+    mode: GetMode,
+    path: String,
+}
+
+enum GetMode {
+    Text,
+    Hex,
+    Version,
 }
 
 enum ReplAction {
@@ -160,6 +177,10 @@ impl Repl {
                 self.command_get(rest).await?;
                 Ok(ReplAction::Continue)
             }
+            "setv" => {
+                self.command_setv(rest).await?;
+                Ok(ReplAction::Continue)
+            }
             "stat" => {
                 self.command_stat(rest).await?;
                 Ok(ReplAction::Continue)
@@ -178,6 +199,10 @@ impl Repl {
             }
             "delete" => {
                 self.command_delete(rest).await?;
+                Ok(ReplAction::Continue)
+            }
+            "delv" => {
+                self.command_delv(rest).await?;
                 Ok(ReplAction::Continue)
             }
             unknown => bail!("unknown command '{unknown}'. run 'help' for available commands"),
@@ -274,33 +299,63 @@ impl Repl {
     }
 
     async fn command_get(&self, rest: &str) -> Result<()> {
-        let (hex, path) = self.parse_get_args(rest)?;
+        let get_args = self.parse_get_args(rest)?;
         let session = self.require_session()?;
 
         let (data, _stat) = session
             .client
-            .get_data(&path)
+            .get_data(&get_args.path)
             .await
-            .with_context(|| format!("failed to read node {path}"))?;
+            .with_context(|| format!("failed to read node {}", get_args.path))?;
 
-        if hex {
-            println!("{}", format_hex(&data));
-            return Ok(());
-        }
-
-        match String::from_utf8(data) {
-            Ok(text) => {
-                if text.is_empty() {
-                    println!("<empty>");
-                } else if text.ends_with('\n') {
-                    print!("{text}");
-                } else {
-                    println!("{text}");
-                }
+        match get_args.mode {
+            GetMode::Hex => {
+                println!("{}", format_hex(&data));
+                Ok(())
             }
-            Err(_) => println!("binary data; run 'get --hex {path}' to inspect bytes"),
-        }
+            GetMode::Version => {
+                println!("{}", _stat.version);
+                Ok(())
+            }
+            GetMode::Text => {
+                match String::from_utf8(data) {
+                    Ok(text) => {
+                        if text.is_empty() {
+                            println!("<empty>");
+                        } else if text.ends_with('\n') {
+                            print!("{text}");
+                        } else {
+                            println!("{text}");
+                        }
+                    }
+                    Err(_) => println!(
+                        "binary data; run 'get --hex {}' to inspect bytes",
+                        get_args.path
+                    ),
+                }
 
+                Ok(())
+            }
+        }
+    }
+
+    async fn command_setv(&self, rest: &str) -> Result<()> {
+        let session = self.require_session()?;
+        let (expected_version, raw_path, value) = parse_setv_args(rest)?;
+        let path = self.resolve_path(raw_path)?;
+
+        let stat = match session
+            .client
+            .set_data(&path, value.as_bytes(), Some(expected_version))
+            .await
+        {
+            Ok(stat) => stat,
+            Err(error) => {
+                return Err(write_error_with_version(&session.client, &path, error, "update").await);
+            }
+        };
+
+        println!("updated {path} to version {}", stat.version);
         Ok(())
     }
 
@@ -352,14 +407,19 @@ impl Repl {
 
     async fn command_set(&self, rest: &str) -> Result<()> {
         let session = self.require_session()?;
-        let (raw_path, value) = parse_path_and_value(rest, true)?;
+        let (expected_version, raw_path, value) = parse_set_args(rest)?;
         let path = self.resolve_path(raw_path)?;
 
-        let stat = session
+        let stat = match session
             .client
-            .set_data(&path, value.as_bytes(), None)
+            .set_data(&path, value.as_bytes(), expected_version)
             .await
-            .with_context(|| format!("failed to update {path}"))?;
+        {
+            Ok(stat) => stat,
+            Err(error) => {
+                return Err(write_error_with_version(&session.client, &path, error, "update").await);
+            }
+        };
 
         println!("updated {path} to version {}", stat.version);
         Ok(())
@@ -367,10 +427,10 @@ impl Repl {
 
     async fn command_delete(&self, rest: &str) -> Result<()> {
         let session = self.require_session()?;
-        let (recursive, raw_path) = parse_delete_args(rest)?;
-        let path = self.resolve_path(raw_path)?;
+        let delete_args = parse_delete_args(rest)?;
+        let path = self.resolve_path(delete_args.path)?;
 
-        if recursive {
+        if delete_args.recursive {
             if path == "/" {
                 bail!("refusing to recursively delete the root node '/'");
             }
@@ -380,34 +440,87 @@ impl Repl {
             return Ok(());
         }
 
-        session
+        match session
             .client
-            .delete(&path, None)
+            .delete(&path, delete_args.expected_version)
             .await
-            .with_context(|| format!("failed to delete {path}"))?;
+        {
+            Ok(()) => {}
+            Err(error) => {
+                return Err(write_error_with_version(&session.client, &path, error, "delete").await);
+            }
+        }
 
         println!("deleted {path}");
         Ok(())
     }
 
-    fn parse_get_args(&self, rest: &str) -> Result<(bool, String)> {
+    async fn command_delv(&self, rest: &str) -> Result<()> {
+        let session = self.require_session()?;
+        let delete_args = parse_delv_args(rest)?;
+        let path = self.resolve_path(delete_args.path)?;
+
+        match session
+            .client
+            .delete(&path, delete_args.expected_version)
+            .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                return Err(write_error_with_version(&session.client, &path, error, "delete").await);
+            }
+        }
+
+        println!("deleted {path}");
+        Ok(())
+    }
+
+    fn parse_get_args(&self, rest: &str) -> Result<GetArgs> {
         let trimmed = rest.trim();
         if trimmed.is_empty() {
-            return Ok((false, self.cwd.clone()));
+            return Ok(GetArgs {
+                mode: GetMode::Text,
+                path: self.cwd.clone(),
+            });
         }
 
-        let (first, remainder) = take_token(trimmed).context("usage: get [--hex] [path]")?;
+        let (first, remainder) =
+            take_token(trimmed).context("usage: get [--hex|--version] [path]")?;
         if first == "--hex" {
             if remainder.trim().is_empty() {
-                return Ok((true, self.cwd.clone()));
+                return Ok(GetArgs {
+                    mode: GetMode::Hex,
+                    path: self.cwd.clone(),
+                });
             }
 
-            let raw_path = parse_single_arg(remainder, "usage: get [--hex] [path]")?;
-            return Ok((true, self.resolve_path(raw_path)?));
+            let raw_path = parse_single_arg(remainder, "usage: get [--hex|--version] [path]")?;
+            return Ok(GetArgs {
+                mode: GetMode::Hex,
+                path: self.resolve_path(raw_path)?,
+            });
         }
 
-        ensure_no_args(remainder, "usage: get [--hex] [path]")?;
-        Ok((false, self.resolve_path(first)?))
+        if first == "--version" {
+            if remainder.trim().is_empty() {
+                return Ok(GetArgs {
+                    mode: GetMode::Version,
+                    path: self.cwd.clone(),
+                });
+            }
+
+            let raw_path = parse_single_arg(remainder, "usage: get [--hex|--version] [path]")?;
+            return Ok(GetArgs {
+                mode: GetMode::Version,
+                path: self.resolve_path(raw_path)?,
+            });
+        }
+
+        ensure_no_args(remainder, "usage: get [--hex|--version] [path]")?;
+        Ok(GetArgs {
+            mode: GetMode::Text,
+            path: self.resolve_path(first)?,
+        })
     }
 
     fn resolve_optional_path(&self, rest: &str, _default: &str) -> Result<String> {
@@ -537,13 +650,18 @@ fn print_help() {
     println!("  pwd                               print current node");
     println!("  get [path]                        print node data as UTF-8");
     println!("  get --hex [path]                  print node data as hex");
+    println!("  get --version [path]              print the current znode version");
     println!("  stat [path]                       print node stat metadata");
     println!("  exists [path]                     check whether a node exists");
     println!("  create <path> [value]             create a persistent node");
     println!("  set <path> <value>                update node data");
+    println!("  set --version <N> <path> <value>  update node data with version check");
+    println!("  setv <N> <path> <value>           alias for version-checked update");
     println!("  delete <path>                     delete a node");
+    println!("  delete --version <N> <path>       delete a node with version check");
     println!("  delete --recursive <path>         delete a node and all descendants");
     println!("  delete -r <path>                  alias for recursive delete");
+    println!("  delv <N> <path>                   alias for version-checked delete");
     println!("  help                              show this help text");
     println!("  quit | exit                       leave the REPL");
     println!();
@@ -553,6 +671,8 @@ fn print_help() {
     println!("  - relative paths are resolved from the current prompt path");
     println!("  - values may contain spaces: set feature_flags/enabled true false");
     println!("  - surrounding single or double quotes are stripped: set /app/msg \"hello world\"");
+    println!("  - set/delete accept --version N to avoid overwriting concurrent changes");
+    println!("  - when a version check fails, zkctl prints the server's current version");
     println!("  - recursive delete prints progress, is fail-fast, and refuses to delete '/'");
 }
 
@@ -573,8 +693,9 @@ fn complete_fixed_values(prefix: &str, values: &[&str]) -> Vec<Pair> {
 
 fn option_candidates(command: &str, arg_index: usize) -> Option<&'static [&'static str]> {
     match (command, arg_index) {
-        ("get", 1) => Some(&["--hex"]),
-        ("delete", 1) => Some(&["--recursive", "-r"]),
+        ("set", 1) => Some(&["--version"]),
+        ("get", 1) => Some(&["--hex", "--version"]),
+        ("delete", 1) => Some(&["--recursive", "-r", "--version"]),
         _ => None,
     }
 }
@@ -587,12 +708,23 @@ fn path_completion_mode(
     match command {
         "ls" | "cd" | "stat" | "exists" if arg_index == 1 => Some(PathCompletionMode::Full),
         "set" if arg_index == 1 => Some(PathCompletionMode::Full),
+        "set" if arg_index == 3 && tokens_before.get(1) == Some(&"--version") => {
+            Some(PathCompletionMode::Full)
+        }
+        "setv" if arg_index == 2 => Some(PathCompletionMode::Full),
         "create" if arg_index == 1 => Some(PathCompletionMode::ParentOnly),
         "get" if arg_index == 1 => Some(PathCompletionMode::Full),
-        "get" if arg_index == 2 && tokens_before.get(1) == Some(&"--hex") => {
+        "get"
+            if arg_index == 2
+                && matches!(tokens_before.get(1), Some(&"--hex") | Some(&"--version")) =>
+        {
             Some(PathCompletionMode::Full)
         }
         "delete" if arg_index == 1 => Some(PathCompletionMode::Full),
+        "delete" if arg_index == 3 && tokens_before.get(1) == Some(&"--version") => {
+            Some(PathCompletionMode::Full)
+        }
+        "delv" if arg_index == 2 => Some(PathCompletionMode::Full),
         "delete"
             if arg_index == 2
                 && matches!(tokens_before.get(1), Some(&"--recursive") | Some(&"-r")) =>
@@ -652,15 +784,77 @@ fn parse_path_and_value<'a>(input: &'a str, require_value: bool) -> Result<(&'a 
     Ok((path, decode_value(trimmed)))
 }
 
-fn parse_delete_args(input: &str) -> Result<(bool, &str)> {
-    let (first, remainder) = take_token(input).context("usage: delete [--recursive] <path>")?;
+fn parse_set_args(input: &str) -> Result<(Option<i32>, &str, String)> {
+    let Some((first, remainder)) = take_token(input) else {
+        bail!("usage: set [--version <N>] <path> <value>");
+    };
+
+    if first == "--version" {
+        let (version_token, remainder) =
+            take_token(remainder).context("usage: set --version <N> <path> <value>")?;
+        let expected_version = parse_version_number(version_token, "set")?;
+        let (path, value) = parse_path_and_value(remainder, true)?;
+        return Ok((Some(expected_version), path, value));
+    }
+
+    let (path, value) = parse_path_and_value(input, true)?;
+    Ok((None, path, value))
+}
+
+fn parse_setv_args(input: &str) -> Result<(i32, &str, String)> {
+    let (version_token, remainder) = take_token(input).context("usage: setv <N> <path> <value>")?;
+    let expected_version = parse_version_number(version_token, "setv")?;
+    let (path, value) = parse_path_and_value(remainder, true)?;
+    Ok((expected_version, path, value))
+}
+
+fn parse_delete_args(input: &str) -> Result<DeleteArgs<'_>> {
+    let (first, remainder) =
+        take_token(input).context("usage: delete [--version <N>|--recursive|-r] <path>")?;
+
     if matches!(first, "--recursive" | "-r") {
         let path = parse_single_arg(remainder, "usage: delete [--recursive|-r] <path>")?;
-        return Ok((true, path));
+        return Ok(DeleteArgs {
+            recursive: true,
+            expected_version: None,
+            path,
+        });
+    }
+
+    if first == "--version" {
+        let (version_token, remainder) =
+            take_token(remainder).context("usage: delete --version <N> <path>")?;
+        let expected_version = parse_version_number(version_token, "delete")?;
+        let path = parse_single_arg(remainder, "usage: delete --version <N> <path>")?;
+        return Ok(DeleteArgs {
+            recursive: false,
+            expected_version: Some(expected_version),
+            path,
+        });
     }
 
     ensure_no_args(remainder, "usage: delete <path>")?;
-    Ok((false, first))
+    Ok(DeleteArgs {
+        recursive: false,
+        expected_version: None,
+        path: first,
+    })
+}
+
+fn parse_delv_args(input: &str) -> Result<DeleteArgs<'_>> {
+    let (version_token, remainder) = take_token(input).context("usage: delv <N> <path>")?;
+    let expected_version = parse_version_number(version_token, "delv")?;
+    let path = parse_single_arg(remainder, "usage: delv <N> <path>")?;
+    Ok(DeleteArgs {
+        recursive: false,
+        expected_version: Some(expected_version),
+        path,
+    })
+}
+
+fn parse_version_number(raw: &str, command: &str) -> Result<i32> {
+    raw.parse::<i32>()
+        .with_context(|| format!("{command} version must be a signed 32-bit integer"))
 }
 
 fn decode_value(raw: &str) -> String {
@@ -817,6 +1011,26 @@ fn list_matching_children(client: &Client, parent_path: &str, name_prefix: &str)
         .into_iter()
         .filter(|child| child.starts_with(name_prefix))
         .collect()
+}
+
+async fn write_error_with_version(
+    client: &Client,
+    path: &str,
+    error: ZkError,
+    action: &str,
+) -> anyhow::Error {
+    let base = format!("failed to {action} {path}: {error}");
+    if error != ZkError::BadVersion {
+        return anyhow!(base);
+    }
+
+    match client.check_stat(path).await {
+        Ok(Some(stat)) => anyhow!(format!("{base} (server version: {})", stat.version)),
+        Ok(None) => anyhow!(format!("{base} (node no longer exists)")),
+        Err(stat_error) => anyhow!(format!(
+            "{base} (also failed to fetch current version: {stat_error})"
+        )),
+    }
 }
 
 async fn delete_recursive(client: &Client, path: &str) -> Result<usize> {

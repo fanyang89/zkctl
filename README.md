@@ -33,13 +33,18 @@ zkctl:/ >
 - `pwd`
 - `get [path]`
 - `get --hex [path]`
+- `get --version [path]`
 - `stat [path]`
 - `exists [path]`
 - `create <path> [value]`
 - `set <path> <value>`
+- `set --version <N> <path> <value>`
+- `setv <N> <path> <value>`
 - `delete <path>`
+- `delete --version <N> <path>`
 - `delete --recursive <path>`
 - `delete -r <path>`
+- `delv <N> <path>`
 - `help`
 - `quit` / `exit`
 
@@ -57,6 +62,12 @@ enabled
 
 zkctl:/app > set feature_flag disabled
 updated /app/feature_flag to version 2
+
+zkctl:/app > set --version 2 feature_flag enabled
+updated /app/feature_flag to version 3
+
+zkctl:/app > get --version feature_flag
+3
 
 zkctl:/app > create greeting "hello world"
 created /app/greeting
@@ -80,6 +91,9 @@ bytes: 11
 - Relative paths are resolved from the current prompt path.
 - `set <path> <value>` treats everything after `<path>` as the value.
 - Surrounding single or double quotes are stripped from values.
+- `set` and `delete` accept `--version <N>` to avoid overwriting concurrent changes.
+- `setv` and `delv` are short aliases for version-checked write operations.
+- When a version check fails, zkctl prints the server's current version.
 - `delete` is non-recursive unless you pass `--recursive`.
 - `delete -r` is an alias for `delete --recursive`.
 - `delete --recursive` prints progress, is fail-fast, and refuses to delete `/`.
