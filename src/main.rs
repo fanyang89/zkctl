@@ -1,9 +1,7 @@
-use std::{
-    cmp::Ordering,
-    io::{self, Write},
-};
+use std::cmp::Ordering;
 
 use anyhow::{Context, Result, bail};
+use rustyline::{DefaultEditor, error::ReadlineError};
 use zookeeper_client::{Acls, Client, CreateMode, Stat};
 
 #[tokio::main]
@@ -39,25 +37,30 @@ impl Default for Repl {
 impl Repl {
     async fn run(&mut self) -> Result<()> {
         print_banner();
+        let mut editor = DefaultEditor::new().context("failed to initialize line editor")?;
 
         loop {
-            print!("{}", self.prompt());
-            io::stdout().flush().context("failed to flush stdout")?;
-
-            let mut input = String::new();
-            let bytes = io::stdin()
-                .read_line(&mut input)
-                .context("failed to read stdin")?;
-
-            if bytes == 0 {
-                println!();
-                break;
-            }
+            let input = match editor.readline(&self.prompt()) {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted) => {
+                    println!("^C");
+                    continue;
+                }
+                Err(ReadlineError::Eof) => {
+                    println!();
+                    break;
+                }
+                Err(error) => return Err(error).context("failed to read command line"),
+            };
 
             let input = input.trim();
             if input.is_empty() {
                 continue;
             }
+
+            editor
+                .add_history_entry(input)
+                .context("failed to record history entry")?;
 
             match self.execute(input).await {
                 Ok(ReplAction::Continue) => {}
@@ -312,8 +315,18 @@ impl Repl {
 
     async fn command_delete(&self, rest: &str) -> Result<()> {
         let session = self.require_session()?;
-        let raw_path = parse_single_arg(rest, "usage: delete <path>")?;
+        let (recursive, raw_path) = parse_delete_args(rest)?;
         let path = self.resolve_path(raw_path)?;
+
+        if recursive {
+            if path == "/" {
+                bail!("refusing to recursively delete the root node '/'");
+            }
+
+            let deleted = delete_recursive(&session.client, &path).await?;
+            println!("deleted {deleted} nodes under {path}");
+            return Ok(());
+        }
 
         session
             .client
@@ -390,7 +403,8 @@ fn print_help() {
     println!("  exists [path]                     check whether a node exists");
     println!("  create <path> [value]             create a persistent node");
     println!("  set <path> <value>                update node data");
-    println!("  delete <path>                     delete a node (non-recursive)");
+    println!("  delete <path>                     delete a node");
+    println!("  delete --recursive <path>         delete a node and all descendants");
     println!("  help                              show this help text");
     println!("  quit | exit                       leave the REPL");
     println!();
@@ -398,6 +412,7 @@ fn print_help() {
     println!("  - relative paths are resolved from the current prompt path");
     println!("  - values may contain spaces: set feature_flags/enabled true false");
     println!("  - surrounding single or double quotes are stripped: set /app/msg \"hello world\"");
+    println!("  - recursive delete prints progress, is fail-fast, and refuses to delete '/'");
 }
 
 fn split_command(input: &str) -> (&str, &str) {
@@ -449,6 +464,17 @@ fn parse_path_and_value<'a>(input: &'a str, require_value: bool) -> Result<(&'a 
     Ok((path, decode_value(trimmed)))
 }
 
+fn parse_delete_args(input: &str) -> Result<(bool, &str)> {
+    let (first, remainder) = take_token(input).context("usage: delete [--recursive] <path>")?;
+    if first == "--recursive" {
+        let path = parse_single_arg(remainder, "usage: delete --recursive <path>")?;
+        return Ok((true, path));
+    }
+
+    ensure_no_args(remainder, "usage: delete <path>")?;
+    Ok((false, first))
+}
+
 fn decode_value(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.len() >= 2 {
@@ -492,6 +518,56 @@ fn normalize_path(cwd: &str, raw_path: &str) -> Result<String> {
         Ok("/".to_string())
     } else {
         Ok(format!("/{}", parts.join("/")))
+    }
+}
+
+async fn delete_recursive(client: &Client, path: &str) -> Result<usize> {
+    let delete_order = collect_delete_order(client, path).await?;
+    let total = delete_order.len();
+
+    println!("deleting {total} nodes under {path}");
+
+    for (index, current_path) in delete_order.iter().enumerate() {
+        client
+            .delete(current_path, None)
+            .await
+            .with_context(|| format!("failed to delete {current_path}"))?;
+        println!("deleted [{}/{}] {}", index + 1, total, current_path);
+    }
+
+    Ok(total)
+}
+
+async fn collect_delete_order(client: &Client, path: &str) -> Result<Vec<String>> {
+    let mut stack = vec![(path.to_string(), false)];
+    let mut delete_order = Vec::new();
+
+    while let Some((current_path, visited_children)) = stack.pop() {
+        if visited_children {
+            delete_order.push(current_path);
+            continue;
+        }
+
+        stack.push((current_path.clone(), true));
+
+        let (children, _stat) = client
+            .get_children(&current_path)
+            .await
+            .with_context(|| format!("failed to list children for {current_path}"))?;
+
+        for child in children.into_iter().rev() {
+            stack.push((join_path(&current_path, &child), false));
+        }
+    }
+
+    Ok(delete_order)
+}
+
+fn join_path(parent: &str, child: &str) -> String {
+    if parent == "/" {
+        format!("/{child}")
+    } else {
+        format!("{parent}/{child}")
     }
 }
 

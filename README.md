@@ -2,6 +2,8 @@
 
 `zkctl` is a ZooKeeper REPL for browsing and editing znodes from a shell-like prompt.
 
+The REPL uses readline-style input, so you get in-session command history and line editing out of the box.
+
 ## Run
 
 ```bash
@@ -36,6 +38,7 @@ zkctl:/ >
 - `create <path> [value]`
 - `set <path> <value>`
 - `delete <path>`
+- `delete --recursive <path>`
 - `help`
 - `quit` / `exit`
 
@@ -66,7 +69,13 @@ bytes: 11
 
 ## Notes
 
+- Up and down arrow keys navigate command history for the current session.
+- Left and right arrow keys, Home, End, Backspace, and Delete work during line editing.
+- `Ctrl-R` performs reverse history search.
+- `Ctrl-C` cancels the current input line.
+- `Ctrl-D` exits the REPL.
 - Relative paths are resolved from the current prompt path.
 - `set <path> <value>` treats everything after `<path>` as the value.
 - Surrounding single or double quotes are stripped from values.
-- `delete` is non-recursive.
+- `delete` is non-recursive unless you pass `--recursive`.
+- `delete --recursive` prints progress, is fail-fast, and refuses to delete `/`.
