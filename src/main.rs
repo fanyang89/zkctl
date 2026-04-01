@@ -22,6 +22,8 @@ const COMMANDS: &[&str] = &[
     "help", "quit", "exit",
 ];
 
+const DEFAULT_SERVERS: &str = "127.0.0.1:2181";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut repl = Repl::default();
@@ -183,7 +185,11 @@ impl Repl {
     }
 
     async fn command_connect(&mut self, rest: &str) -> Result<()> {
-        let servers = parse_single_arg(rest, "usage: connect <host:port[,host:port]>")?;
+        let servers = if rest.trim().is_empty() {
+            DEFAULT_SERVERS
+        } else {
+            parse_single_arg(rest, "usage: connect [host:port[,host:port]]")?
+        };
         let client = Client::connect(servers)
             .await
             .with_context(|| format!("failed to connect to {servers}"))?;
@@ -524,7 +530,7 @@ fn print_banner() {
 
 fn print_help() {
     println!("Commands:");
-    println!("  connect <host:port[,host:port]>   connect to ZooKeeper");
+    println!("  connect [host:port[,host:port]]   connect to ZooKeeper");
     println!("  auth digest <user:pass>           add digest auth to current session");
     println!("  ls [path]                         list child nodes");
     println!("  cd <path>                         change current node");
@@ -537,11 +543,13 @@ fn print_help() {
     println!("  set <path> <value>                update node data");
     println!("  delete <path>                     delete a node");
     println!("  delete --recursive <path>         delete a node and all descendants");
+    println!("  delete -r <path>                  alias for recursive delete");
     println!("  help                              show this help text");
     println!("  quit | exit                       leave the REPL");
     println!();
     println!("Notes:");
     println!("  - Tab completes command names and ZooKeeper paths");
+    println!("  - connect with no arguments uses 127.0.0.1:2181");
     println!("  - relative paths are resolved from the current prompt path");
     println!("  - values may contain spaces: set feature_flags/enabled true false");
     println!("  - surrounding single or double quotes are stripped: set /app/msg \"hello world\"");
@@ -566,7 +574,7 @@ fn complete_fixed_values(prefix: &str, values: &[&str]) -> Vec<Pair> {
 fn option_candidates(command: &str, arg_index: usize) -> Option<&'static [&'static str]> {
     match (command, arg_index) {
         ("get", 1) => Some(&["--hex"]),
-        ("delete", 1) => Some(&["--recursive"]),
+        ("delete", 1) => Some(&["--recursive", "-r"]),
         _ => None,
     }
 }
@@ -585,7 +593,10 @@ fn path_completion_mode(
             Some(PathCompletionMode::Full)
         }
         "delete" if arg_index == 1 => Some(PathCompletionMode::Full),
-        "delete" if arg_index == 2 && tokens_before.get(1) == Some(&"--recursive") => {
+        "delete"
+            if arg_index == 2
+                && matches!(tokens_before.get(1), Some(&"--recursive") | Some(&"-r")) =>
+        {
             Some(PathCompletionMode::Full)
         }
         _ => None,
@@ -643,8 +654,8 @@ fn parse_path_and_value<'a>(input: &'a str, require_value: bool) -> Result<(&'a 
 
 fn parse_delete_args(input: &str) -> Result<(bool, &str)> {
     let (first, remainder) = take_token(input).context("usage: delete [--recursive] <path>")?;
-    if first == "--recursive" {
-        let path = parse_single_arg(remainder, "usage: delete --recursive <path>")?;
+    if matches!(first, "--recursive" | "-r") {
+        let path = parse_single_arg(remainder, "usage: delete [--recursive|-r] <path>")?;
         return Ok((true, path));
     }
 

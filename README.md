@@ -19,14 +19,14 @@ zkctl>
 Connect first:
 
 ```text
-zkctl> connect 127.0.0.1:2181
+zkctl> connect
 connected to 127.0.0.1:2181 (anonymous)
 zkctl:/ >
 ```
 
 ## Commands
 
-- `connect <host:port[,host:port]>`
+- `connect [host:port[,host:port]]`
 - `auth digest <user:pass>`
 - `ls [path]`
 - `cd <path>`
@@ -39,13 +39,14 @@ zkctl:/ >
 - `set <path> <value>`
 - `delete <path>`
 - `delete --recursive <path>`
+- `delete -r <path>`
 - `help`
 - `quit` / `exit`
 
 ## Examples
 
 ```text
-zkctl> connect 127.0.0.1:2181
+zkctl> connect
 zkctl:/ > ls
 app
 config
@@ -75,8 +76,10 @@ bytes: 11
 - `Ctrl-C` cancels the current input line.
 - `Ctrl-D` exits the REPL.
 - `Tab` completes command names and ZooKeeper paths.
+- `connect` with no arguments uses `127.0.0.1:2181`.
 - Relative paths are resolved from the current prompt path.
 - `set <path> <value>` treats everything after `<path>` as the value.
 - Surrounding single or double quotes are stripped from values.
 - `delete` is non-recursive unless you pass `--recursive`.
+- `delete -r` is an alias for `delete --recursive`.
 - `delete --recursive` prints progress, is fail-fast, and refuses to delete `/`.
