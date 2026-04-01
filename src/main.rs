@@ -1,8 +1,26 @@
-use std::cmp::Ordering;
+use std::{
+    cmp::Ordering,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result, bail};
-use rustyline::{DefaultEditor, error::ReadlineError};
+use rustyline::{
+    Context as RustylineContext, Editor, Helper,
+    completion::{Completer, Pair},
+    config::{CompletionType, Configurer},
+    error::ReadlineError,
+    highlight::Highlighter,
+    hint::Hinter,
+    history::DefaultHistory,
+    validate::Validator,
+};
+use tokio::{runtime::Handle, task::block_in_place};
 use zookeeper_client::{Acls, Client, CreateMode, Stat};
+
+const COMMANDS: &[&str] = &[
+    "connect", "auth", "ls", "cd", "pwd", "get", "stat", "exists", "create", "set", "delete",
+    "help", "quit", "exit",
+];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,11 +31,28 @@ async fn main() -> Result<()> {
 struct Repl {
     session: Option<Session>,
     cwd: String,
+    completion_state: Arc<Mutex<CompletionState>>,
 }
 
 struct Session {
     client: Client,
     auth_summary: String,
+}
+
+#[derive(Default)]
+struct CompletionState {
+    cwd: String,
+    client: Option<Client>,
+}
+
+#[derive(Clone, Copy)]
+enum PathCompletionMode {
+    Full,
+    ParentOnly,
+}
+
+struct ReplHelper {
+    state: Arc<Mutex<CompletionState>>,
 }
 
 enum ReplAction {
@@ -30,6 +65,10 @@ impl Default for Repl {
         Self {
             session: None,
             cwd: "/".to_string(),
+            completion_state: Arc::new(Mutex::new(CompletionState {
+                cwd: "/".to_string(),
+                client: None,
+            })),
         }
     }
 }
@@ -37,7 +76,12 @@ impl Default for Repl {
 impl Repl {
     async fn run(&mut self) -> Result<()> {
         print_banner();
-        let mut editor = DefaultEditor::new().context("failed to initialize line editor")?;
+        let mut editor: Editor<ReplHelper, DefaultHistory> =
+            Editor::new().context("failed to initialize line editor")?;
+        editor.set_completion_type(CompletionType::List);
+        editor.set_helper(Some(ReplHelper {
+            state: Arc::clone(&self.completion_state),
+        }));
 
         loop {
             let input = match editor.readline(&self.prompt()) {
@@ -149,6 +193,7 @@ impl Repl {
             auth_summary: "anonymous".to_string(),
         });
         self.cwd = "/".to_string();
+        self.sync_completion_state();
 
         println!("connected to {servers} (anonymous)");
         Ok(())
@@ -195,6 +240,7 @@ impl Repl {
         }
 
         self.cwd = path;
+        self.sync_completion_state();
         Ok(())
     }
 
@@ -383,6 +429,92 @@ impl Repl {
             .as_mut()
             .context("not connected. run 'connect <host:port[,host:port]>' first")
     }
+
+    fn sync_completion_state(&self) {
+        if let Ok(mut state) = self.completion_state.lock() {
+            state.cwd = self.cwd.clone();
+            state.client = self.session.as_ref().map(|session| session.client.clone());
+        }
+    }
+}
+
+impl Helper for ReplHelper {}
+
+impl Hinter for ReplHelper {
+    type Hint = String;
+}
+
+impl Highlighter for ReplHelper {}
+
+impl Validator for ReplHelper {}
+
+impl Completer for ReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &RustylineContext<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let before_cursor = &line[..pos];
+        let token_start = before_cursor
+            .rfind(char::is_whitespace)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let current_token = &before_cursor[token_start..];
+        let tokens_before = before_cursor[..token_start]
+            .split_whitespace()
+            .collect::<Vec<_>>();
+
+        if tokens_before.is_empty() {
+            return Ok((token_start, complete_command_names(current_token)));
+        }
+
+        let command = tokens_before[0];
+        let arg_index = tokens_before.len();
+
+        if let Some(option_names) = option_candidates(command, arg_index) {
+            if current_token.starts_with('-') {
+                return Ok((
+                    token_start,
+                    complete_fixed_values(current_token, option_names),
+                ));
+            }
+        }
+
+        let Some(mode) = path_completion_mode(command, arg_index, &tokens_before) else {
+            return Ok((token_start, Vec::new()));
+        };
+
+        Ok((token_start, self.complete_path_token(current_token, mode)))
+    }
+}
+
+impl ReplHelper {
+    fn complete_path_token(&self, raw_token: &str, mode: PathCompletionMode) -> Vec<Pair> {
+        let Some((cwd, client)) = self.snapshot() else {
+            return Vec::new();
+        };
+
+        let replacements = match mode {
+            PathCompletionMode::Full => existing_path_replacements(&cwd, &client, raw_token),
+            PathCompletionMode::ParentOnly => parent_path_replacements(&cwd, &client, raw_token),
+        };
+
+        replacements
+            .into_iter()
+            .map(|replacement| Pair {
+                display: replacement.clone(),
+                replacement,
+            })
+            .collect()
+    }
+
+    fn snapshot(&self) -> Option<(String, Client)> {
+        let state = self.state.lock().ok()?;
+        Some((state.cwd.clone(), state.client.clone()?))
+    }
 }
 
 fn print_banner() {
@@ -409,10 +541,55 @@ fn print_help() {
     println!("  quit | exit                       leave the REPL");
     println!();
     println!("Notes:");
+    println!("  - Tab completes command names and ZooKeeper paths");
     println!("  - relative paths are resolved from the current prompt path");
     println!("  - values may contain spaces: set feature_flags/enabled true false");
     println!("  - surrounding single or double quotes are stripped: set /app/msg \"hello world\"");
     println!("  - recursive delete prints progress, is fail-fast, and refuses to delete '/'");
+}
+
+fn complete_command_names(prefix: &str) -> Vec<Pair> {
+    complete_fixed_values(prefix, COMMANDS)
+}
+
+fn complete_fixed_values(prefix: &str, values: &[&str]) -> Vec<Pair> {
+    values
+        .iter()
+        .filter(|value| value.starts_with(prefix))
+        .map(|value| Pair {
+            display: (*value).to_string(),
+            replacement: (*value).to_string(),
+        })
+        .collect()
+}
+
+fn option_candidates(command: &str, arg_index: usize) -> Option<&'static [&'static str]> {
+    match (command, arg_index) {
+        ("get", 1) => Some(&["--hex"]),
+        ("delete", 1) => Some(&["--recursive"]),
+        _ => None,
+    }
+}
+
+fn path_completion_mode(
+    command: &str,
+    arg_index: usize,
+    tokens_before: &[&str],
+) -> Option<PathCompletionMode> {
+    match command {
+        "ls" | "cd" | "stat" | "exists" if arg_index == 1 => Some(PathCompletionMode::Full),
+        "set" if arg_index == 1 => Some(PathCompletionMode::Full),
+        "create" if arg_index == 1 => Some(PathCompletionMode::ParentOnly),
+        "get" if arg_index == 1 => Some(PathCompletionMode::Full),
+        "get" if arg_index == 2 && tokens_before.get(1) == Some(&"--hex") => {
+            Some(PathCompletionMode::Full)
+        }
+        "delete" if arg_index == 1 => Some(PathCompletionMode::Full),
+        "delete" if arg_index == 2 && tokens_before.get(1) == Some(&"--recursive") => {
+            Some(PathCompletionMode::Full)
+        }
+        _ => None,
+    }
 }
 
 fn split_command(input: &str) -> (&str, &str) {
@@ -519,6 +696,116 @@ fn normalize_path(cwd: &str, raw_path: &str) -> Result<String> {
     } else {
         Ok(format!("/{}", parts.join("/")))
     }
+}
+
+fn existing_path_replacements(cwd: &str, client: &Client, raw_token: &str) -> Vec<String> {
+    let Ok((parent_path, replacement_prefix, name_prefix)) = full_path_lookup(cwd, raw_token)
+    else {
+        return Vec::new();
+    };
+
+    list_matching_children(client, &parent_path, &name_prefix)
+        .into_iter()
+        .map(|child| format!("{replacement_prefix}{child}"))
+        .collect()
+}
+
+fn parent_path_replacements(cwd: &str, client: &Client, raw_token: &str) -> Vec<String> {
+    if raw_token.is_empty() {
+        return list_matching_children(client, cwd, "")
+            .into_iter()
+            .map(|child| format!("{child}/"))
+            .collect();
+    }
+
+    if raw_token.ends_with('/') {
+        let Ok((parent_path, replacement_prefix, _)) = full_path_lookup(cwd, raw_token) else {
+            return Vec::new();
+        };
+
+        return list_matching_children(client, &parent_path, "")
+            .into_iter()
+            .map(|child| format!("{replacement_prefix}{child}/"))
+            .collect();
+    }
+
+    let Some(separator_index) = raw_token.rfind('/') else {
+        return Vec::new();
+    };
+
+    let leaf_suffix = &raw_token[separator_index + 1..];
+    let parent_token = if separator_index == 0 && raw_token.starts_with('/') {
+        "/"
+    } else {
+        &raw_token[..separator_index]
+    };
+
+    let parent_replacements = if parent_token == "/" {
+        vec!["/".to_string()]
+    } else {
+        existing_path_replacements(cwd, client, parent_token)
+    };
+
+    parent_replacements
+        .into_iter()
+        .map(|parent| {
+            if parent == "/" {
+                format!("/{leaf_suffix}")
+            } else {
+                format!("{parent}/{leaf_suffix}")
+            }
+        })
+        .collect()
+}
+
+fn full_path_lookup(cwd: &str, raw_token: &str) -> Result<(String, String, String)> {
+    if raw_token.is_empty() {
+        return Ok((cwd.to_string(), String::new(), String::new()));
+    }
+
+    if raw_token.ends_with('/') {
+        let parent_input = if raw_token == "/" {
+            "/"
+        } else {
+            raw_token.trim_end_matches('/')
+        };
+        let parent_path = normalize_path(cwd, parent_input)?;
+        return Ok((parent_path, raw_token.to_string(), String::new()));
+    }
+
+    if let Some(separator_index) = raw_token.rfind('/') {
+        let parent_input = if separator_index == 0 && raw_token.starts_with('/') {
+            "/"
+        } else {
+            &raw_token[..separator_index]
+        };
+        let parent_path = normalize_path(cwd, parent_input)?;
+        let replacement_prefix = raw_token[..separator_index + 1].to_string();
+        let name_prefix = raw_token[separator_index + 1..].to_string();
+        return Ok((parent_path, replacement_prefix, name_prefix));
+    }
+
+    Ok((cwd.to_string(), String::new(), raw_token.to_string()))
+}
+
+fn list_matching_children(client: &Client, parent_path: &str, name_prefix: &str) -> Vec<String> {
+    let client = client.clone();
+    let parent_path = parent_path.to_string();
+    let mut children = block_in_place(|| {
+        Handle::current().block_on(async move {
+            client
+                .get_children(&parent_path)
+                .await
+                .map(|(children, _)| children)
+                .unwrap_or_default()
+        })
+    });
+
+    children.sort_by(|left, right| natural_cmp(left, right));
+    children
+        .into_iter()
+        .filter(|child| child.starts_with(name_prefix))
+        .collect()
 }
 
 async fn delete_recursive(client: &Client, path: &str) -> Result<usize> {

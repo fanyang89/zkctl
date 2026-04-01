@@ -74,6 +74,7 @@ bytes: 11
 - `Ctrl-R` performs reverse history search.
 - `Ctrl-C` cancels the current input line.
 - `Ctrl-D` exits the REPL.
+- `Tab` completes command names and ZooKeeper paths.
 - Relative paths are resolved from the current prompt path.
 - `set <path> <value>` treats everything after `<path>` as the value.
 - Surrounding single or double quotes are stripped from values.
