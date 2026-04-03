@@ -19,10 +19,12 @@ use zookeeper_client::{Acls, Client, CreateMode, Error as ZkError, Stat};
 
 const COMMANDS: &[&str] = &[
     "connect", "auth", "ls", "cd", "pwd", "get", "stat", "exists", "create", "set", "setv",
-    "delete", "delv", "help", "quit", "exit",
+    "delete", "delv", "clear", "help", "quit", "exit",
 ];
 
 const DEFAULT_SERVERS: &str = "127.0.0.1:2181";
+const CLEAR_CONFIRMATION_TEXT: &str = "CLEAR";
+const PRESERVED_ROOT_CHILDREN: &[&str] = &["zookeeper"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,6 +36,7 @@ struct Repl {
     session: Option<Session>,
     cwd: String,
     completion_state: Arc<Mutex<CompletionState>>,
+    pending_confirmation: Option<PendingAction>,
 }
 
 struct Session {
@@ -79,6 +82,10 @@ enum ReplAction {
     Exit,
 }
 
+enum PendingAction {
+    ClearAll,
+}
+
 impl Default for Repl {
     fn default() -> Self {
         Self {
@@ -88,6 +95,7 @@ impl Default for Repl {
                 cwd: "/".to_string(),
                 client: None,
             })),
+            pending_confirmation: None,
         }
     }
 }
@@ -136,6 +144,10 @@ impl Repl {
     }
 
     fn prompt(&self) -> String {
+        if self.pending_confirmation.is_some() {
+            return "clear> ".to_string();
+        }
+
         if self.session.is_some() {
             format!("zkctl:{} > ", self.cwd)
         } else {
@@ -144,6 +156,10 @@ impl Repl {
     }
 
     async fn execute(&mut self, input: &str) -> Result<ReplAction> {
+        if self.pending_confirmation.is_some() {
+            return self.execute_pending_confirmation(input).await;
+        }
+
         let (command, rest) = split_command(input);
 
         match command {
@@ -205,7 +221,36 @@ impl Repl {
                 self.command_delv(rest).await?;
                 Ok(ReplAction::Continue)
             }
+            "clear" => {
+                self.command_clear(rest).await?;
+                Ok(ReplAction::Continue)
+            }
             unknown => bail!("unknown command '{unknown}'. run 'help' for available commands"),
+        }
+    }
+
+    async fn execute_pending_confirmation(&mut self, input: &str) -> Result<ReplAction> {
+        let Some(action) = self.pending_confirmation.take() else {
+            return Ok(ReplAction::Continue);
+        };
+
+        match action {
+            PendingAction::ClearAll => {
+                if input != CLEAR_CONFIRMATION_TEXT {
+                    println!("clear cancelled");
+                    return Ok(ReplAction::Continue);
+                }
+
+                let session = self.require_session()?;
+                let deleted = clear_user_data(&session.client).await?;
+                if deleted == 0 {
+                    println!("nothing to clear");
+                } else {
+                    println!("cleared {deleted} nodes from '/'");
+                }
+
+                Ok(ReplAction::Continue)
+            }
         }
     }
 
@@ -351,7 +396,9 @@ impl Repl {
         {
             Ok(stat) => stat,
             Err(error) => {
-                return Err(write_error_with_version(&session.client, &path, error, "update").await);
+                return Err(
+                    write_error_with_version(&session.client, &path, error, "update").await,
+                );
             }
         };
 
@@ -417,7 +464,9 @@ impl Repl {
         {
             Ok(stat) => stat,
             Err(error) => {
-                return Err(write_error_with_version(&session.client, &path, error, "update").await);
+                return Err(
+                    write_error_with_version(&session.client, &path, error, "update").await,
+                );
             }
         };
 
@@ -447,7 +496,9 @@ impl Repl {
         {
             Ok(()) => {}
             Err(error) => {
-                return Err(write_error_with_version(&session.client, &path, error, "delete").await);
+                return Err(
+                    write_error_with_version(&session.client, &path, error, "delete").await,
+                );
             }
         }
 
@@ -467,11 +518,24 @@ impl Repl {
         {
             Ok(()) => {}
             Err(error) => {
-                return Err(write_error_with_version(&session.client, &path, error, "delete").await);
+                return Err(
+                    write_error_with_version(&session.client, &path, error, "delete").await,
+                );
             }
         }
 
         println!("deleted {path}");
+        Ok(())
+    }
+
+    async fn command_clear(&mut self, rest: &str) -> Result<()> {
+        self.require_session()?;
+        ensure_no_args(rest, "usage: clear")?;
+
+        self.pending_confirmation = Some(PendingAction::ClearAll);
+        println!("This will permanently delete all user znodes under '/'.");
+        println!("The '/zookeeper' system subtree will be preserved.");
+        println!("Type {CLEAR_CONFIRMATION_TEXT} to confirm, or anything else to cancel.");
         Ok(())
     }
 
@@ -662,6 +726,7 @@ fn print_help() {
     println!("  delete --recursive <path>         delete a node and all descendants");
     println!("  delete -r <path>                  alias for recursive delete");
     println!("  delv <N> <path>                   alias for version-checked delete");
+    println!("  clear                             delete all user data under '/'");
     println!("  help                              show this help text");
     println!("  quit | exit                       leave the REPL");
     println!();
@@ -674,6 +739,7 @@ fn print_help() {
     println!("  - set/delete accept --version N to avoid overwriting concurrent changes");
     println!("  - when a version check fails, zkctl prints the server's current version");
     println!("  - recursive delete prints progress, is fail-fast, and refuses to delete '/'");
+    println!("  - clear requires typing {CLEAR_CONFIRMATION_TEXT} and preserves '/zookeeper'");
 }
 
 fn complete_command_names(prefix: &str) -> Vec<Pair> {
@@ -1048,6 +1114,32 @@ async fn delete_recursive(client: &Client, path: &str) -> Result<usize> {
     }
 
     Ok(total)
+}
+
+async fn clear_user_data(client: &Client) -> Result<usize> {
+    let (children, _stat) = client
+        .get_children("/")
+        .await
+        .context("failed to list children for /")?;
+
+    let targets = children
+        .into_iter()
+        .filter(|child| !PRESERVED_ROOT_CHILDREN.contains(&child.as_str()))
+        .map(|child| join_path("/", &child))
+        .collect::<Vec<_>>();
+
+    if targets.is_empty() {
+        return Ok(0);
+    }
+
+    println!("clearing {} root nodes under /", targets.len());
+
+    let mut total_deleted = 0;
+    for path in targets {
+        total_deleted += delete_recursive(client, &path).await?;
+    }
+
+    Ok(total_deleted)
 }
 
 async fn collect_delete_order(client: &Client, path: &str) -> Result<Vec<String>> {

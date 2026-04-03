@@ -45,6 +45,7 @@ zkctl:/ >
 - `delete --recursive <path>`
 - `delete -r <path>`
 - `delv <N> <path>`
+- `clear`
 - `help`
 - `quit` / `exit`
 
@@ -97,3 +98,4 @@ bytes: 11
 - `delete` is non-recursive unless you pass `--recursive`.
 - `delete -r` is an alias for `delete --recursive`.
 - `delete --recursive` prints progress, is fail-fast, and refuses to delete `/`.
+- `clear` deletes all user znodes under `/`, preserves `/zookeeper`, and asks for an explicit confirmation token before continuing.
