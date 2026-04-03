@@ -10,6 +10,12 @@ The REPL uses readline-style input, so you get in-session command history and li
 cargo run
 ```
 
+Run commands directly without entering the REPL:
+
+```bash
+cargo run -- -c connect -c "ls /"
+```
+
 After startup you will see a prompt like:
 
 ```text
@@ -99,3 +105,5 @@ bytes: 11
 - `delete -r` is an alias for `delete --recursive`.
 - `delete --recursive` prints progress, is fail-fast, and refuses to delete `/`.
 - `clear` deletes all user znodes under `/`, preserves `/zookeeper`, and asks for an explicit confirmation token before continuing.
+- Use repeated `-c` or `--command` flags to run zkctl commands non-interactively, for example `zkctl -c connect -c "ls /"`.
+- In direct execution mode, `clear` still requires confirmation: `zkctl -c connect -c clear -c CLEAR`.

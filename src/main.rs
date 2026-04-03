@@ -26,10 +26,24 @@ const DEFAULT_SERVERS: &str = "127.0.0.1:2181";
 const CLEAR_CONFIRMATION_TEXT: &str = "CLEAR";
 const PRESERVED_ROOT_CHILDREN: &[&str] = &["zookeeper"];
 
+enum StartupMode {
+    Interactive,
+    Commands(Vec<String>),
+    Help,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let startup_mode = parse_startup_args()?;
     let mut repl = Repl::default();
-    repl.run().await
+    match startup_mode {
+        StartupMode::Interactive => repl.run().await,
+        StartupMode::Commands(commands) => repl.run_commands(&commands).await,
+        StartupMode::Help => {
+            print_startup_help();
+            Ok(())
+        }
+    }
 }
 
 struct Repl {
@@ -138,6 +152,31 @@ impl Repl {
                 Ok(ReplAction::Exit) => break,
                 Err(error) => eprintln!("error: {error:#}"),
             }
+        }
+
+        Ok(())
+    }
+
+    async fn run_commands(&mut self, commands: &[String]) -> Result<()> {
+        for command in commands {
+            let input = command.trim();
+            if input.is_empty() {
+                continue;
+            }
+
+            match self.execute(input).await {
+                Ok(ReplAction::Continue) => {}
+                Ok(ReplAction::Exit) => break,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("failed to run command: {input}"));
+                }
+            }
+        }
+
+        if self.pending_confirmation.is_some() {
+            bail!(
+                "command sequence ended while waiting for confirmation; append '-c {CLEAR_CONFIRMATION_TEXT}' to continue"
+            );
         }
 
         Ok(())
@@ -705,6 +744,47 @@ fn print_banner() {
     println!("run 'help' to see available commands");
 }
 
+fn parse_startup_args() -> Result<StartupMode> {
+    let mut commands = Vec::new();
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" | "--command" => {
+                let command = args
+                    .next()
+                    .with_context(|| format!("missing value for {arg}\n\n{}", startup_usage()))?;
+                commands.push(command);
+            }
+            "-h" | "--help" => return Ok(StartupMode::Help),
+            unknown => bail!("unknown argument '{unknown}'\n\n{}", startup_usage()),
+        }
+    }
+
+    if commands.is_empty() {
+        Ok(StartupMode::Interactive)
+    } else {
+        Ok(StartupMode::Commands(commands))
+    }
+}
+
+fn print_startup_help() {
+    println!("Usage: zkctl [-c <command>]...");
+    println!();
+    println!("Options:");
+    println!("  -c, --command <command>  run a zkctl command and exit; may be repeated");
+    println!("  -h, --help               show this startup help");
+    println!();
+    println!("Examples:");
+    println!("  zkctl -c connect -c \"ls /\"");
+    println!("  zkctl -c \"connect 127.0.0.1:2181\" -c \"get /app/config\"");
+    println!("  zkctl -c connect -c clear -c {CLEAR_CONFIRMATION_TEXT}");
+}
+
+fn startup_usage() -> &'static str {
+    "usage: zkctl [-c <command>]..."
+}
+
 fn print_help() {
     println!("Commands:");
     println!("  connect [host:port[,host:port]]   connect to ZooKeeper");
@@ -740,6 +820,9 @@ fn print_help() {
     println!("  - when a version check fails, zkctl prints the server's current version");
     println!("  - recursive delete prints progress, is fail-fast, and refuses to delete '/'");
     println!("  - clear requires typing {CLEAR_CONFIRMATION_TEXT} and preserves '/zookeeper'");
+    println!(
+        "  - run commands non-interactively with -c/--command, for example: zkctl -c connect -c \"ls /\""
+    );
 }
 
 fn complete_command_names(prefix: &str) -> Vec<Pair> {
